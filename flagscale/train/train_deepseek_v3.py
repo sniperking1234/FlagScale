@@ -18,7 +18,7 @@ from megatron.training import get_args
 from megatron.training import print_rank_0
 from megatron.training import get_timers
 from megatron.training import get_tokenizer
-from megatron.core import mpu, tensor_parallel
+from megatron.core import mpu
 from megatron.core.enums import ModelType
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
@@ -48,9 +48,9 @@ from flagscale.train.train import pretrain
 from flagscale.train.global_vars import get_parallel_context
 
 from flagscale.train.models.deepseek_v3.deepseek_v3_model import DeepSeekV3Model
+from flagscale.train.models.deepseek_v3.multi_token_predictor import roll_tensor
 
 stimer = StragglerDetector()
-
 
 def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megatron.legacy.model.GPTModel]:
     """Builds the model.
@@ -67,6 +67,7 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
     """
     args = get_args()
     use_te = args.transformer_impl == "transformer_engine"
+    assert use_te is True, "DeepSeek V3 requires Transformer Engine"
 
     if args.record_memory_history:
         torch.cuda.memory._record_memory_history(True,
@@ -75,6 +76,15 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
 
             # record stack information for the trace events
             trace_alloc_record_context=True)
+
+        def oom_observer(device, alloc, device_alloc, device_free):
+            # snapshot right after an OOM happened
+            print('saving allocated state during OOM')
+            snapshot = torch.cuda.memory._snapshot()
+            from pickle import dump
+            dump(snapshot, open(f"oom_rank-{torch.distributed.get_rank()}_{args.memory_snapshot_path}", 'wb'))
+
+        torch._C._cuda_attach_out_of_memory_observer(oom_observer)
 
     print_rank_0('building GPT model ...')
     # Experimental loading arguments from yaml
@@ -90,7 +100,6 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
             config = core_transformer_config_from_args(args)
 
     assert args.use_legacy_models is False
-    
     if args.use_legacy_models:
         model = megatron.legacy.model.GPTModel(
             config,
@@ -140,6 +149,66 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
     return model
 
 
+
+def _get_batch_on_this_tp_rank(data_iterator):
+
+    args = get_args()
+
+    def _broadcast(item):
+       if item is not None:
+           torch.distributed.broadcast(item, mpu.get_tensor_model_parallel_src_rank(), group=mpu.get_tensor_model_parallel_group())
+
+    if mpu.get_tensor_model_parallel_rank() == 0:
+
+       if data_iterator is not None:
+           data = next(data_iterator)
+       else:
+           data = None
+
+       batch = {
+           'tokens': data["tokens"].cuda(non_blocking = True),
+           'labels': data["labels"].cuda(non_blocking = True),
+           'loss_mask': data["loss_mask"].cuda(non_blocking = True),
+           'attention_mask': None if "attention_mask" not in data else data["attention_mask"].cuda(non_blocking = True),
+           'position_ids': data["position_ids"].cuda(non_blocking = True)
+       }
+
+       _broadcast(batch['tokens'])
+       _broadcast(batch['labels'])
+       _broadcast(batch['loss_mask'])
+       _broadcast(batch['attention_mask'])
+       _broadcast(batch['position_ids'])
+
+    else:
+
+       tokens=torch.empty((args.micro_batch_size,args.seq_length), dtype = torch.int64 , device = torch.cuda.current_device())
+       labels=torch.empty((args.micro_batch_size,args.seq_length), dtype = torch.int64 , device = torch.cuda.current_device())
+       loss_mask=torch.empty((args.micro_batch_size,args.seq_length), dtype = torch.float32 , device = torch.cuda.current_device())
+       if args.create_attention_mask_in_dataloader:
+           attention_mask=torch.empty(
+                (args.micro_batch_size,1,args.seq_length,args.seq_length), dtype = torch.bool , device = torch.cuda.current_device()
+            )
+       else:
+           attention_mask=None
+       position_ids=torch.empty((args.micro_batch_size,args.seq_length), dtype = torch.int64 , device = torch.cuda.current_device())
+
+       _broadcast(tokens)
+       _broadcast(labels)
+       _broadcast(loss_mask)
+       _broadcast(attention_mask)
+       _broadcast(position_ids)
+
+       batch = {
+           'tokens': tokens,
+           'labels': labels,
+           'loss_mask': loss_mask,
+           'attention_mask': attention_mask,
+           'position_ids': position_ids
+       }
+
+    return batch
+
+
 def get_batch(data_iterator):
     """Generate a batch."""
 
@@ -148,29 +217,27 @@ def get_batch(data_iterator):
         return None, None, None, None, None
 
     # get batches based on the TP rank you are on
-    batch = get_batch_on_this_tp_rank(data_iterator)
+    batch = _get_batch_on_this_tp_rank(data_iterator)
 
     # slice batch along sequence dimension for context parallelism
     batch = get_batch_on_this_cp_rank(batch)
-    
+
     # slice batch along sequence dimension for ulysses sequence parallelism
     batch = get_batch_on_this_ulysses_sp_rank(batch)
-    
+
     return batch.values()
 
 
-# define spiky loss as a variation of 20% or more
-SPIKY_LOSS_PERC = 0.2
+# define spiky loss as a loss that's 10x the max loss observed
+SPIKY_LOSS_FACTOR = 10
 
 
-
-def loss_func(labels: torch.Tensor, loss_mask: torch.Tensor, logits: torch.Tensor):
-    """Multimodal loss function.
+def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
+    """Loss function.
 
     Args:
-        labels  (torch.Tensor): Used to compute loss with logits
         loss_mask (torch.Tensor): Used to mask out some portions of the loss
-        logits (torch.Tensor): The output tensor of transformer
+        output_tensor (torch.Tensor): The tensor with the losses
 
     Returns:
         the loss scalar for this micro-batch
@@ -178,18 +245,34 @@ def loss_func(labels: torch.Tensor, loss_mask: torch.Tensor, logits: torch.Tenso
         a dict containing reporting metrics on the loss and number of tokens across
             the data parallel ranks
     """
-    args = get_args()    
+    args = get_args()
     loss_mask = loss_mask.view(-1).float() # [b*s]
     total_tokens = loss_mask.sum()
-    
+
+    loss = output_tensor
+    use_mtp_predictor = True if args.num_mtp_predictor > 0 else False
+    if use_mtp_predictor:
+        loss, loss_mtps = output_tensor # [b s]
+    roll_loss_mask = loss_mask # [b*s]
+
     # cal loss for main model
-    labels = labels.transpose(0, 1).contiguous() # [b s] => [s b]
-    logits = logits.transpose(0, 1).contiguous() # [b s h] => [s b h]
-        
-    losses = tensor_parallel.vocab_parallel_cross_entropy(logits.float(), labels)
-    losses = losses.transpose(0, 1).contiguous().float()
-    
-    loss = torch.cat([torch.sum(losses.view(-1) * loss_mask).view(1), total_tokens.view(1)])
+    loss = torch.cat([torch.sum(loss.view(-1) * loss_mask).view(1), total_tokens.view(1)])
+    # cal loss for mtp modules
+    if use_mtp_predictor:
+        loss_mask_mtps = []
+        total_tokens_mtps = 0
+        for i in range(args.num_mtp_predictor):
+            loss_mask_mtp, total_tokens_mtp = roll_tensor(roll_loss_mask, dims=0)
+            roll_loss_mask = loss_mask_mtp
+            total_tokens_mtps += total_tokens_mtp
+            loss_mask_mtps.append(loss_mask_mtp)
+        loss_mask_mtps = torch.cat(loss_mask_mtps, 0)
+        loss_mtps = torch.cat([torch.sum(loss_mtps.view(-1) * loss_mask_mtps).view(1), total_tokens_mtps.view(1)])
+        loss_mtps = loss_mtps / args.num_mtp_predictor
+
+    # merge main model loss and mtp predictor loss
+    if use_mtp_predictor:
+        loss = loss + loss_mtps
 
     # loss printing
     if args.context_parallel_size > 1:
@@ -205,11 +288,22 @@ def loss_func(labels: torch.Tensor, loss_mask: torch.Tensor, logits: torch.Tenso
             tolerance=0.0,        # forward pass calculations are determinisic
             fatal=True,
         )
+        rerun_state_machine.validate_result(
+            result=loss[0],
+            rejection_func=torch.isinf,
+            message="found Inf in local forward loss calculation",
+            tolerance=0.0,        # forward pass calculations are determinisic
+            fatal=True,
+        )
     # Check for spiky loss
     if args.check_for_spiky_loss:
         rerun_state_machine.validate_result(
             result=loss[0],
-            rejection_func=partial(rerun_state_machine.is_spiky_loss, threshold=SPIKY_LOSS_PERC),
+            rejection_func=partial(
+                rerun_state_machine.is_unexpectedly_large,
+                threshold=SPIKY_LOSS_FACTOR,
+                context="loss",
+            ),
             message="Spiky loss",
             tolerance=0.0,        # forward pass calculations are determinisic
             fatal=False,
@@ -218,9 +312,12 @@ def loss_func(labels: torch.Tensor, loss_mask: torch.Tensor, logits: torch.Tenso
     reporting_loss = loss.clone().detach()
     torch.distributed.all_reduce(reporting_loss, group=mpu.get_data_parallel_group())
 
+    # loss[0] is a view of loss, so it has ._base not None, which triggers assert error
+    # in core/pipeline_parallel/schedule.py::deallocate_output_tensor, calling .clone()
+    # on loss[0] fixes this
     local_num_tokens = loss[1].clone().detach().to(torch.int)
     return (
-        loss[0] * args.context_parallel_size,
+        loss[0].clone(),
         local_num_tokens,
         {'lm loss': (reporting_loss[0], reporting_loss[1])},
     )
@@ -246,9 +343,9 @@ def forward_step(data_iterator, model: GPTModel):
 
     with stimer:
         output_tensor = model(tokens, position_ids, attention_mask,
-                              labels=None)
+                              labels=labels)
 
-    return output_tensor, partial(loss_func, labels, loss_mask)
+    return output_tensor, partial(loss_func, loss_mask)
 
 
 def is_dataset_built_on_rank():

@@ -23,7 +23,7 @@ from megatron.core.dist_checkpointing.serialization import get_default_load_shar
 from megatron.core.dist_checkpointing.strategies.fully_parallel import \
     FullyParallelSaveStrategyWrapper, FullyParallelLoadStrategyWrapper
 from megatron.core.num_microbatches_calculator import update_num_microbatches
-from megatron.core.utils import is_float8tensor
+from megatron.core.fp8_utils import is_float8tensor
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from .async_utils import schedule_async_save, is_empty_async_queue
 from .global_vars import get_args, get_one_logger
@@ -324,7 +324,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
     start_ckpt = time()
     args = get_args()
 
-    if not is_empty_async_queue():
+    if args.async_save and not is_empty_async_queue():
         print_rank_0('WARNING: Starting a checkpoint save before previous has finished. Consider increasing the checkpoint interval.')
 
     # Prepare E2E metrics at start of save checkpoint
@@ -464,7 +464,10 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
         else:
             # [ModelOpt]: Inject modelopt_state into state_dict
             if has_nvidia_modelopt:
-                save_modelopt_state(model, state_dict)
+                if ckpt_type == CheckpointType.LOCAL:
+                    print_rank_0('WARNING: Local checkpointing does not support nvidia_modelopt.')
+                else:
+                    save_modelopt_state(model, state_dict)
 
             end_ckpt = time()
             logger.debug(f"rank: {rank}, takes {end_ckpt - start_ckpt} to prepare state dict for ckpt ")
@@ -1108,7 +1111,8 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
             raise FileNotFoundError("No checkpoint found in load directory or pretrained directory")
         args.finetune = True
 
-    model = unwrap_model(model)
+    ddp_model = model
+    model = unwrap_model(ddp_model)
 
     load_kwargs = {}
     is_dist_ckpt = False
@@ -1182,7 +1186,12 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
                 gen_sd_opt_param_scheduler = None
 
             # Determine if rerun state will be loaded
-            if (ckpt_tp_pp == run_tp_pp and not release and not args.finetune):
+            if (
+                ckpt_tp_pp == run_tp_pp
+                and not release
+                and not args.finetune
+                and 'rerun_state_machine' in state_dict
+            ):
                 rerun_state_machine = get_rerun_state_machine()
                 gen_sd_rerun_state = rerun_state_machine.state_dict(
                     data_iterator=None, use_dist_ckpt=True
@@ -1196,8 +1205,8 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
             # after the model instance has been created and before _load_base_checkpoint is called.
             if has_nvidia_modelopt:
                 if ckpt_type == CheckpointType.LOCAL:
-                    raise NotImplementedError('Local checkpointing does not support model opt')
-                if not args.use_dist_ckpt:
+                    print_rank_0('WARNING: Local checkpointing does not support nvidia_modelopt.')
+                elif ckpt_type == CheckpointType.GLOBAL:
                     restore_modelopt_state(model, state_dict)
                 else:
                     restore_sharded_modelopt_state(model, checkpoint_name)
@@ -1265,12 +1274,12 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
     # Model.
     strict = False if args.retro_add_retriever else strict
     if not skip_load_to_model_and_opt:
-        if len(model) == 1:
-            model[0].load_state_dict(state_dict['model'], strict=strict)
+        if len(ddp_model) == 1:
+            ddp_model[0].load_state_dict(state_dict['model'], strict=strict)
         else:
-            for i in range(len(model)):
+            for i in range(len(ddp_model)):
                 mpu.set_virtual_pipeline_model_parallel_rank(i)
-                model[i].load_state_dict(state_dict['model%d' % i], strict=strict)
+                ddp_model[i].load_state_dict(state_dict['model%d' % i], strict=strict)
 
     # Fix up query/key/value matrix ordering if needed.
     checkpoint_version = get_checkpoint_version()
@@ -1367,6 +1376,11 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
                  f'[ t {mpu.get_tensor_model_parallel_rank() + 1}/{mpu.get_tensor_model_parallel_world_size()}, '
                  f'p {mpu.get_pipeline_model_parallel_rank() + 1}/{mpu.get_pipeline_model_parallel_world_size()} ] '
                  f'at iteration {iteration}')
+
+    # Additional callback for wandb (last rank)
+    if not torch.distributed.is_initialized() \
+       or is_last_rank():
+        wandb_utils.on_load_checkpoint_success(checkpoint_name, load_dir)
 
     torch.cuda.empty_cache()
 

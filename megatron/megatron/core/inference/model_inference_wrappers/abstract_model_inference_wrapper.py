@@ -48,15 +48,18 @@ class AbstractModelInferenceWrapper(abc.ABC):
             else self.inference_wrapper_config.params_dtype
         )
 
+        max_batch_size = self.inference_wrapper_config.inference_max_requests
+        max_sequence_length = self.inference_wrapper_config.inference_max_seq_length
+        self.inference_params = InferenceParams(max_batch_size, max_sequence_length)
+
     def prep_model_for_inference(self, prompts_tokens: torch.Tensor):
         """A utility function for preparing model for inference
 
         The function gets called once before the auto regressive inference loop.
-        It puts the model in eval mode and initializes the inference_params.
+        It puts the model in eval mode.
 
         Args:
             prompts_tokens (torch.Tensor): A tensor of shape [batch_size, max_seq_len]
-
         """
         self.model.eval()
 
@@ -64,8 +67,8 @@ class AbstractModelInferenceWrapper(abc.ABC):
         self.model_is_pipeline_parallel = not (
             parallel_state.is_pipeline_first_stage() and parallel_state.is_pipeline_last_stage()
         )
-        batch_size, max_sequence_length = prompts_tokens.shape
-        self.inference_params = InferenceParams(batch_size, max_sequence_length)
+
+        self.inference_params.reset()
 
     @abc.abstractmethod
     def prep_inference_input(self, prompt_tokens) -> Dict[str, Any]:
@@ -101,8 +104,13 @@ class AbstractModelInferenceWrapper(abc.ABC):
         tokens = inference_input["tokens"]
         position_ids = inference_input["position_ids"]
         attention_mask = inference_input["attention_mask"]
+        runtime_gather_output = inference_input.get("runtime_gather_output")
         return self.model(
-            tokens, position_ids, attention_mask, inference_params=self.inference_params
+            tokens,
+            position_ids,
+            attention_mask,
+            inference_params=self.inference_params,
+            runtime_gather_output=runtime_gather_output,
         )
 
     def _get_batch_size_and_seq_len(
@@ -167,6 +175,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
         tokens = inference_input["tokens"]
         position_ids = inference_input["position_ids"]
         attention_mask = inference_input["attention_mask"]
+
         batch_size, seq_len = self._get_batch_size_and_seq_len(tokens, recv_buffer_seq_len)
         recv_buffer = None
         if not parallel_state.is_pipeline_first_stage():
@@ -210,6 +219,11 @@ class AbstractModelInferenceWrapper(abc.ABC):
         tokens = inference_input["tokens"]
         position_ids = inference_input["position_ids"]
         attention_mask = inference_input["attention_mask"]
+        runtime_gather_output = inference_input.get("runtime_gather_output")
+        materialize_only_last_token_logits = (
+            self.inference_params.materialize_only_last_token_logits
+        )
+
         micro_batch_size = max(
             1,
             self.inference_wrapper_config.inference_batch_times_seqlen_threshold // tokens.size(1),
@@ -221,8 +235,9 @@ class AbstractModelInferenceWrapper(abc.ABC):
         logits = None
         # Preallocate memory for output logits.
         if parallel_state.is_pipeline_last_stage():
+            logits_seq_len = 1 if materialize_only_last_token_logits else seq_len
             logits = torch.empty(
-                (batch_size, seq_len, self.inference_wrapper_config.padded_vocab_size),
+                (batch_size, logits_seq_len, self.inference_wrapper_config.padded_vocab_size),
                 dtype=self.pipeline_communication_dtype,
                 device=torch.cuda.current_device(),
             )
@@ -245,11 +260,13 @@ class AbstractModelInferenceWrapper(abc.ABC):
                 recv_from_prev_pipeline_rank_(recv_buffer)
 
             self.model.set_input_tensor(recv_buffer)
+
             output_tensor = self._forward(
                 {
                     "tokens": tokens2use,
                     "position_ids": position_ids2use,
                     "attention_mask": attention_mask,
+                    "runtime_gather_output": runtime_gather_output,
                 }
             )
 
@@ -265,8 +282,10 @@ class AbstractModelInferenceWrapper(abc.ABC):
                 assert logits is not None
                 logits[start:end, ...] = output_tensor
 
-                # Explicitly cast logits to expected dtype
-                logits = logits.to(self.inference_wrapper_config.params_dtype)
+        # Explicitly cast logits to expected dtype
+        if parallel_state.is_pipeline_last_stage():
+            assert logits is not None
+            logits = logits.to(self.inference_wrapper_config.params_dtype)
 
         # Once done with all micro batches, we reset batch size offset and seq len offset
         self.inference_params.sequence_len_offset += seq_len

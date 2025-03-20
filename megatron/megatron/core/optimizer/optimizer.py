@@ -298,7 +298,7 @@ class MegatronOptimizer(ABC):
         """
 
     @staticmethod
-    def _extract_common_per_param_step(state_dict) -> Union[int, torch.Tensor]:
+    def _extract_common_per_param_step(state_dict) -> Union[int, torch.Tensor, None]:
         common_step = None
         for param_idx, param_state in state_dict['state'].items():
             param_step = param_state.get('step', None)
@@ -395,10 +395,10 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         # Update across all model parallel instances.
         groups = self.get_grad_stats_parallel_group()
         if isinstance(groups, list):
-            if "gloo" in torch.distributed.get_backend(groups[0]):
+            if "cpu:gloo" == torch.distributed.get_backend(groups[0]):
                 self.found_inf = self.found_inf.cpu()
         else:
-            if "gloo" in torch.distributed.get_backend(groups):
+            if "cpu:gloo" == torch.distributed.get_backend(groups):
                 self.found_inf = self.found_inf.cpu()
         if not isinstance(groups, list):
             groups = [groups]
@@ -721,7 +721,8 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         )
         # save step as a shared step among all parameters. Separate per-parameter
         # steps are not supported
-        state_dict['optimizer']['state']['common_step'] = step
+        if step:
+            state_dict['optimizer']['state']['common_step'] = step
         return state_dict
 
     def load_state_dict(self, state_dict):
@@ -897,7 +898,8 @@ class FP32Optimizer(MegatronOptimizer):
         optim_state_to_sharding_state(state_dict, id_to_sharded_param_map, exclude_keys="step")
         # save step as a shared step among all parameters. Separate per-parameter
         # steps are not supported
-        state_dict['state']['common_step'] = step
+        if step:
+            state_dict['state']['common_step'] = step
         return state_dict
 
 

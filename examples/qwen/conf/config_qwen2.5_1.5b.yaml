@@ -9,10 +9,10 @@ experiment:
   task:
     type: train
     backend: megatron
-    entrypoint: ./flagscale/train/train_aquila.py
+    entrypoint: ./flagscale/train/train_gpt.py
   runner:
     backend: torchrun
-    nnodes: 2 
+    nnodes: 2
     nproc_per_node: 8
     hostfile: torchrun # Please replace with your actual hostfile path
   envs:

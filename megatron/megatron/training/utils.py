@@ -34,6 +34,7 @@ from megatron.training import (
     get_adlr_autoresume,
 )
 from megatron.core import DistributedDataParallel as DDP
+from megatron.core.distributed.custom_fsdp import FullyShardedDataParallel as custom_FSDP
 from megatron.core import mpu
 from megatron.core.datasets.utils import get_blend_from_list
 from megatron.core.tensor_parallel import param_is_not_tensor_parallel_duplicate
@@ -48,10 +49,11 @@ from megatron.legacy.model.module import param_is_not_shared
 
 try:
     from megatron.core.distributed import TorchFullyShardedDataParallel as torch_FSDP
-    ALL_MODULE_WRAPPER_CLASSNAMES = (DDP, torch_FSDP, Float16Module)
+    ALL_MODULE_WRAPPER_CLASSNAMES = (DDP, torch_FSDP, custom_FSDP, Float16Module)
 except ImportError:
-    ALL_MODULE_WRAPPER_CLASSNAMES = (DDP, Float16Module)
+    ALL_MODULE_WRAPPER_CLASSNAMES = (DDP, custom_FSDP, Float16Module)
 
+from flagscale.train.hetero.p2p_communication import get_device_type_for_comm
 
 def unwrap_model(model, module_instances=ALL_MODULE_WRAPPER_CLASSNAMES):
     return_list = True
@@ -79,6 +81,7 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
     sharded_params_data = []
     data_parallel_group = None
 
+    custom_fsdp_all_param_is_shared = False
     for model_chunk in model:
         for param in model_chunk.parameters():
             data_parallel_group = get_data_parallel_group_if_dtensor(param, data_parallel_group)
@@ -86,6 +89,12 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
             if not is_not_tp_duplicate:
                 continue
             assert is_not_tp_duplicate
+            if hasattr(param, "fully_shard_param_local_shard"):
+                param = param.fully_shard_param_local_shard
+                assert [getattr(p, "fully_shard_param_local_shard", None) is not None for p in model_chunk.parameters()]
+                custom_fsdp_all_param_is_shared = True
+                if param.numel() == 0:
+                    continue
             if not getattr(param, 'allreduce', True):
                 # TODO: Implement memory optimization for MoE parameters.
                 assert param_is_not_shared(param)
@@ -146,14 +155,17 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
         )
         norm_2 += sharded_norm_2
 
+    if custom_fsdp_all_param_is_shared:
+        torch.distributed.all_reduce(norm_2,
+                                     op=torch.distributed.ReduceOp.SUM,
+                                     group=mpu.get_data_parallel_group())
+
     # Sum across all model-parallel GPUs(tensor + pipeline).
     mp_groups = mpu.get_model_parallel_group()
     if isinstance(mp_groups, list):
-        if len(mp_groups) > 1:
-            assert mpu.get_expert_model_parallel_world_size() <= 1, f"Expert model parallelism is not supported with  heterogeneous model parallelism"
         original_norm_2 = norm_2.clone().detach()
         for mp_group in mp_groups:
-            norm_2 = original_norm_2.clone()
+            norm_2.copy_(original_norm_2)
             torch.distributed.all_reduce(norm_2,
                                             op=torch.distributed.ReduceOp.SUM,
                                             group=mp_group)
@@ -174,12 +186,27 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
             False # no per-parameter norm.
         )
         moe_norm_2 = moe_norm * moe_norm
+
+        if custom_fsdp_all_param_is_shared:
+            torch.distributed.all_reduce(moe_norm_2,
+                                        op=torch.distributed.ReduceOp.SUM,
+                                        group=mpu.get_expert_data_parallel_group())
+
         # Sum across expert tensor, model and pipeline parallel GPUs.
-        torch.distributed.all_reduce(
-            moe_norm_2,
-            op=torch.distributed.ReduceOp.SUM,
-            group=mpu.get_expert_tensor_model_pipeline_parallel_group()
-        )
+        emp_groups = mpu.get_expert_tensor_model_pipeline_parallel_group()
+        if isinstance(emp_groups, list):
+            original_norm_2 = moe_norm_2.clone().detach()
+            for emp_group in emp_groups:
+                moe_norm_2.copy_(original_norm_2)
+                torch.distributed.all_reduce(moe_norm_2,
+                                                op=torch.distributed.ReduceOp.SUM,
+                                                group=emp_group)
+        else:
+            torch.distributed.all_reduce(
+                moe_norm_2,
+                op=torch.distributed.ReduceOp.SUM,
+                group=mpu.get_expert_tensor_model_pipeline_parallel_group()
+            )
         norm_2 += moe_norm_2
 
     return norm_2.item() ** 0.5
@@ -207,10 +234,18 @@ def reduce_max_stat_across_model_parallel_group(stat: float) -> float:
     """
     if stat is None:
         stat = -1.0
-    stat = torch.tensor([stat], dtype=torch.float32, device=torch.cuda.current_device())
-    torch.distributed.all_reduce(
-        stat, op=torch.distributed.ReduceOp.MAX, group=mpu.get_model_parallel_group()
-    )
+    model_parallel_groups = mpu.get_model_parallel_group()
+    if not isinstance(model_parallel_groups, list):
+        stat = torch.tensor([stat], dtype=torch.float32, device=get_device_type_for_comm(model_parallel_groups))
+        torch.distributed.all_reduce(
+            stat, op=torch.distributed.ReduceOp.MAX, group=mpu.get_model_parallel_group()
+        )
+    else:
+        stat = torch.tensor([stat], dtype=torch.float32, device=get_device_type_for_comm(model_parallel_groups[0]))
+        for model_parallel_group in model_parallel_groups:
+            torch.distributed.all_reduce(
+                stat, op=torch.distributed.ReduceOp.MAX, group=model_parallel_group
+            )
     if stat.item() == -1.0:
         return None
     else:
@@ -225,10 +260,18 @@ def logical_and_across_model_parallel_group(input: bool) -> bool:
         input = 1
     else:
         input = 0
-    input = torch.tensor([input], dtype=torch.int, device=torch.cuda.current_device())
-    torch.distributed.all_reduce(
-        input, op=torch.distributed.ReduceOp.MIN, group=mpu.get_model_parallel_group()
-    )
+    model_parallel_groups = mpu.get_model_parallel_group()
+    if not isinstance(model_parallel_groups, list):
+        input = torch.tensor([input], dtype=torch.int, device=get_device_type_for_comm(model_parallel_groups))
+        torch.distributed.all_reduce(
+            input, op=torch.distributed.ReduceOp.MIN, group=mpu.get_model_parallel_group()
+        )
+    else:
+        input = torch.tensor([input], dtype=torch.int, device=get_device_type_for_comm(model_parallel_groups[0]))
+        for model_parallel_group in model_parallel_groups:
+            torch.distributed.all_reduce(
+                input, op=torch.distributed.ReduceOp.MIN, group=model_parallel_group
+            )
     return bool(input.item())
 
 
@@ -378,6 +421,9 @@ def print_rank_last(message):
     else:
         print(message, flush=True)
 
+def get_device_arch_version():
+    """Returns GPU arch version (8: Ampere, 9: Hopper, 10: Blackwell, ...)"""
+    return torch.cuda.get_device_properties(torch.device("cuda:0")).major
 
 def append_to_progress_log(string, barrier=True):
     """Append given string to progress log."""

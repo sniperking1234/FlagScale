@@ -3,7 +3,7 @@
 The test module supports:
 
 1. Unit testing for different backends and operation modes.
-2. Functional testing for multiple models, strategies, and heterogeneous hardware.
+2. Functional testing revolves around the training, compression, inference, and service of large language models.
 3. Monitoring incremental code test coverage and viewing test reports online.
 4. Ensuring code style consistency.
 
@@ -48,34 +48,34 @@ When you create a PR using your forked repository, the testing workflow will aut
 
      ```yaml
      # backend: The backend for unit testing, either flagscale or megatron
-     megatron: 
+     megatron:
        # Set the environment required before running unit tests
-       set_environment: 
+       set_environment:
          cd megatron; export PYTHONPATH=..:$PYTHONPATH
        # Specify the target folder for test coverage
-       coverage: 
+       coverage:
          core
        # Select different tests for different test directories
-       subset: 
+       subset:
          # Use default configuration if not shown
          dist_checkpointing:
            # Files to ignore during testing
-           ignore: models/test_mamba.py 
+           ignore: models/test_mamba.py
          models:
            ignore: test_mamba_model.py
          transformer/moe:
-           # Test mode: 
+           # Test mode:
            # batch (default): Run all test files at once
            # single: Run each test file individually
            # NOTE: Batch mode runs faster, single mode avoids environment interference among tests
-           type: single 
+           type: single
            ignore: test_upcycling.py
          transformer:
            # Test depth
            # all (default): All test files within the directory
            # Integer: Test files at the specified path depth
            # NOTE: Useful for running test files within a folder, rather than in subdirectories
-           depth: 1 
+           depth: 1
          ...
      ```
 
@@ -85,13 +85,13 @@ When you create a PR using your forked repository, the testing workflow will aut
 
      ```yaml
      ...
-     
+
      # Megatron Unit Tests with Matrix
      megatron-unit-tests:
        uses: ./.github/workflows/unit-tests.yml
        strategy:
          matrix:
-           subset: 
+           subset:
              # Add your new folder if you have a new test directory
              - {NEW_FOLD}
              - data
@@ -130,20 +130,20 @@ When you create a PR using your forked repository, the testing workflow will aut
 ### Viewing Incremental Code Test Coverage Report
 
 - **View Locally:**
-  
+
   1. Run the command:
      ```bash
      # Ensure unit tests have been run locally before executing this command
      ./tests/scripts/unit_tests/test_coverage.sh --backend ${BACKEND} --status ${STATUS}
      ```
-     
+
      Please set the following variables:
 
      - `BACKEND`: `flagscale` or `megatron`.
      - `STATUS`: `online` or `offline`.
 
   2. View the report:
-     
+
      Open the following in a browser:
      `/workspace/report/${ID}/diff-cover-report-${BACKEND}.html`
      Use these variables:
@@ -151,7 +151,7 @@ When you create a PR using your forked repository, the testing workflow will aut
      - `BACKEND`: `flagscale` or `megatron`.
 
 - **View Online:**
-  
+
   Find the corresponding action for your [PR](https://github.com/FlagOpen/FlagScale/pulls) in [All Tests](https://github.com/FlagOpen/FlagScale/actions/workflows/all-tests.yml), open the `flagscale-coverage-test` or `megatron-coverage-test` jobs, and click on the address under `Coverage Online Report` to view the test report online.
 
 ---
@@ -161,13 +161,13 @@ When you create a PR using your forked repository, the testing workflow will aut
 ### Run Specific Functional Tests Locally
 
 ```bash
-tests/scripts/functional_tests/test_model.sh --type ${TYPE} --model ${MODEL}
+tests/scripts/functional_tests/test_task.sh --type ${TYPE} --task ${TASK}
 ```
 
 Please set the following variables:
 
 - `TYPE`: The type of functional testing, supporting `train` or `hetero_train`.
-- `MODEL`: The model used for functional testing, in conjunction with `TYPE`. Specific models can be found under the `tests/functional_tests/test_cases` directory.
+- `TASK`: The task used for functional testing, in conjunction with `TYPE`. Specific tasks can be found under the `tests/functional_tests/test_cases` directory.
 
 ### Run All Functional Tests Locally
 
@@ -189,10 +189,9 @@ Find the corresponding action for your [PR](https://github.com/FlagOpen/FlagScal
    train:
      # Models used
      aquila:
-       test_cases:
-         # Parallel modes
-         -tp2_pp2
-         -tp4_pp2 
+        # Parallel modes
+        -tp2_pp2
+        -tp4_pp2
    ...
    ```
 
@@ -212,13 +211,13 @@ Find the corresponding action for your [PR](https://github.com/FlagOpen/FlagScal
    └── results_test
    ```
 
-   *Note: We have included data and model files that you can use. For more details, consult the training configuration file of the respective test case. If you need to add your own test data or model files, please contact us.*
+   *Note: We have included data and task files that you can use. For more details, consult the training configuration file of the respective test case. If you need to add your own test data or task files, please contact us.*
 
 3. Modify the yml configuration file in the workflow to enable online testing:
 
    ```yaml
    ...
-   
+
    # Functional Tests with Model and Type Matrix
    functional-tests-train:
      needs:
@@ -227,14 +226,14 @@ Find the corresponding action for your [PR](https://github.com/FlagOpen/FlagScal
      uses: ./.github/workflows/functional-tests.yml
      strategy:
        matrix:
-         model: 
-           # Add the new model if applicable
-           - {NEW_MODEL}
+         task:
+           # Add the new task if applicable
+           - {NEW_TASK}
            - aquila
            - mixtral
-     name: "train-${{ matrix.model }}"
+     name: "train-${{ matrix.task }}"
      with:
-       model: ${{ matrix.model }}
+       task: ${{ matrix.task }}
        type: train
 
    ...

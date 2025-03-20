@@ -90,10 +90,29 @@ def _load_checkpoint(queue, args):
         ckpt_value = getattr(checkpoint_args, arg_name, None)
         setattr(margs, arg_name, ckpt_value)
 
+    _set_arg("decoder_first_pipeline_num_layers")
+    _set_arg("tensor_model_parallel_size")
+    _set_arg("pipeline_model_parallel_size")
     _set_arg("expert_model_parallel_size")
     _set_arg("num_experts")
     _set_arg("sequence_parallel")
-    
+
+    # for mla
+    _set_arg("q_lora_rank")
+    _set_arg("kv_lora_rank")
+    _set_arg("q_head_dim")
+    _set_arg("qk_pos_emb_head_dim")
+    _set_arg("v_head_dim")
+    _set_arg("multi_latent_attention")
+    _set_arg("apply_rope_fusion")
+    _set_arg("qk_layernorm")
+    # for moe
+    _set_arg("moe_grouped_gemm")
+    _set_arg("moe_router_enable_expert_bias")
+    _set_arg("moe_router_score_function")
+    # for mtp
+    _set_arg("num_mtp_predictor")
+
     # for hetero
     _set_arg("enable_hetero")
     _set_arg("hetero_process_meshes")
@@ -108,7 +127,7 @@ def _load_checkpoint(queue, args):
     # Arguments do sanity checks on the world size, but we don't care,
     # so trick it into thinking we are plenty of processes
     margs.world_size = margs.tensor_model_parallel_size * margs.pipeline_model_parallel_size * margs.expert_model_parallel_size
-    
+
     # Explicitly copy data types from checkpoint.
     margs.fp16 = checkpoint_args.fp16
     margs.bf16 = checkpoint_args.bf16
@@ -210,6 +229,7 @@ def _load_checkpoint(queue, args):
     md.previous_tensor_parallel_size = margs.tensor_model_parallel_size
     md.previous_pipeline_parallel_size = margs.pipeline_model_parallel_size
     md.previous_expert_parallel_size = margs.expert_model_parallel_size
+    md.previous_decoder_first_pipeline_num_layers = margs.decoder_first_pipeline_num_layers
     md.true_vocab_size = args.true_vocab_size # true (non-padded) vocab size
     md.make_vocab_size_divisible_by = margs.make_vocab_size_divisible_by
     md.checkpoint_args = checkpoint_args
@@ -241,7 +261,7 @@ def _load_checkpoint(queue, args):
                     model_.append(this_model)
             else:
                 pre_process = mpu.is_pipeline_first_stage()
-                post_process = mpu.is_pipeline_last_stage() 
+                post_process = mpu.is_pipeline_last_stage()
                 model_ = [model_plugin.get_mg_model(dtype, pre_process, post_process)]
 
             margs.consumed_train_samples = 0
@@ -294,7 +314,7 @@ def _load_checkpoint(queue, args):
             models = all_models[pp_rank][vp_rank]
             for layer_id in range(len(models[0].decoder.layers)):
                 message = dict()
-
+                margs.total_layer_num = total_layer_num
                 ckpt_plugin.get_attn_ckpt(message, models, layer_id, margs)
                 ckpt_plugin.get_mlp_ckpt(message, models, layer_id, margs)
 
@@ -310,6 +330,13 @@ def _load_checkpoint(queue, args):
         message = dict()
         ckpt_plugin.get_output_layer_ckpt(message, models, margs)
         queue_put("output layer", message)
+
+    message = dict()
+    if margs.num_mtp_predictor:
+        for mtp_layer_id in range(margs.num_mtp_predictor):
+            message = dict()
+            ckpt_plugin.get_mtp_ckpt(message, models, mtp_layer_id, margs)
+            queue_put(f"mtp module {mtp_layer_id}", message)
 
     queue.put("done")
 

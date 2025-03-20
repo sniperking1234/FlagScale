@@ -8,6 +8,17 @@ import torch
 from megatron.core import parallel_state
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 
+try:
+    from megatron.core.extensions.transformer_engine import (
+        fused_permute,
+        fused_sort_chunks_by_index,
+        fused_unpermute,
+    )
+
+    HAVE_TE = True
+except ImportError:
+    HAVE_TE = False
+
 
 def switch_load_balancing_loss_func(
     probs: torch.Tensor,
@@ -207,7 +218,13 @@ class MoEAuxLossAutoScaler(torch.autograd.Function):
         MoEAuxLossAutoScaler.main_loss_backward_scale = scale
 
 
-def permute(tokens, routing_map, num_out_tokens: int = None, drop_and_pad: bool = False):
+def permute(
+    tokens,
+    routing_map,
+    num_out_tokens: Optional[int] = None,
+    fused: bool = False,
+    drop_and_pad: bool = False,
+):
     """Permute the tokens and probs based on the mask.
     Tokens with the same designated expert will be grouped together.
     The shape of mask is [tokens, num_experts], it indicates which experts were selected
@@ -221,11 +238,17 @@ def permute(tokens, routing_map, num_out_tokens: int = None, drop_and_pad: bool 
         routing_map (torch.Tensor): The sparse token to expert mapping, [num_tokens, num_experts].
         num_out_tokens (int, optional): The number of output tokens. If None, it's set to
                                         the number of input tokens.
+        fused (bool, optional): Whether use the fused permute function.
         drop_and_pad (bool, optional): Whether or not the token dispatcher uses token-drop
                                        and pads the number of tokens to the expert capacity.
                                        If set to true, routing_map has a fixed number of non-zeros
                                        in each column.
     """
+    if fused:
+        if not HAVE_TE or fused_permute is None:
+            raise ValueError("fused_permute is not available. Please install TE >= 2.1.0.")
+        return fused_permute(tokens, routing_map, num_out_tokens)
+
     num_tokens, hidden = tokens.shape
     num_experts = routing_map.shape[1]
     if drop_and_pad and not (num_out_tokens is None):
@@ -262,6 +285,7 @@ def unpermute(
     restore_shape: torch.Size,
     probs: torch.Tensor = None,
     routing_map: torch.Tensor = None,
+    fused: bool = False,
     drop_and_pad: bool = False,
 ):
     """
@@ -281,13 +305,20 @@ def unpermute(
         probs (torch.Tensor, optional): The unpermuted probs tensor,
         routing_map (torch.Tensor, optional): Token to expert mapping, shape
             [num_tokens, num_experts].
+        fused (bool, optional): Whether use the fused unpermute function.
         drop_and_pad (bool, optional): Whether or not the token dispatcher uses token-drop
                                        and pads the number of tokens to the expert capacity.
 
     Returns:
         torch.Tensor: The tokens restored to their original order.
     """
+    if fused:
+        if not HAVE_TE or fused_unpermute is None:
+            raise ValueError("fused_unpermute is not available. Please install TE >= 2.1.0.")
+        return fused_unpermute(permuted_tokens, sorted_indices, probs, restore_shape)
+
     _, hidden = restore_shape
+    input_dtype = permuted_tokens.dtype
 
     if probs is not None:
         assert routing_map is not None, "Mask must be provided to permute the probs."
@@ -309,21 +340,34 @@ def unpermute(
             permuted_probs = probs_T_1D.index_select(0, indices_1D)
         else:
             permuted_probs = probs.T.contiguous().masked_select(routing_map.T.contiguous())
+        # Here may promote permuted_tokens to higher precision (fp32/fp64) if probs is in
+        # higher precision due to moe_router_dtype being enabled. This can lead to
+        # additional GPU memory usage. Use --moe-permute-fusion flag to avoid this extra memory
+        # allocation.
         permuted_tokens = permuted_tokens * permuted_probs.unsqueeze(-1)
 
     # Create an output tensor filled with zeros
     output_tokens = torch.zeros(
-        restore_shape, device=permuted_tokens.device, dtype=permuted_tokens.dtype
+        restore_shape, dtype=permuted_tokens.dtype, device=permuted_tokens.device
     )
     # Scatter add the permuted_input back to the original positions
     output_tokens.scatter_add_(0, sorted_indices.unsqueeze(1).expand(-1, hidden), permuted_tokens)
-    return output_tokens
+    return output_tokens.to(dtype=input_dtype)
 
 
-def sort_chunks_by_idxs(input: torch.Tensor, split_sizes: torch.Tensor, sorted_idxs: torch.Tensor):
+def sort_chunks_by_idxs(
+    input: torch.Tensor, split_sizes: torch.Tensor, sorted_idxs: torch.Tensor, fused: bool = False
+):
     """Split and sort the input tensor based on the split_sizes and sorted indices."""
+    if fused:
+        if not HAVE_TE or fused_sort_chunks_by_index is None:
+            raise ValueError(
+                "fused_sort_chunks_by_index is not available. Please install TE >= 2.1.0."
+            )
+        return fused_sort_chunks_by_index(input, split_sizes, sorted_idxs)
+
     input = torch.split(input, split_sizes.tolist(), dim=0)
-    output = torch.cat([input[i] for i in sorted_idxs], dim=0)
+    output = torch.cat([input[i] for i in sorted_idxs.tolist()], dim=0)
     return output
 
 
@@ -402,7 +446,8 @@ def topk_softmax_with_capacity(
         topk (int): The number of experts to select for each token.
         capacity_factor (float): The capacity factor of each expert. Will drop tokens if the number
                                of tokens exceeds the capacity.
-        pad_to_capacity (bool): Whether to need padding in token drop mode.
+        pad_to_capacity (bool): Whether to need padding in token drop mode. The probs for padded
+                               tokens will be 0.
         drop_policy (str): The policy to drop tokens. Can be either "prob" or "position".
                            If "prob", the tokens with the lowest probabilities will be dropped.
                            If "position", tokens at the end of each batch will be dropped.
@@ -553,14 +598,40 @@ def reduce_aux_losses_tracker_across_ranks():
             torch.distributed.all_reduce(
                 values, group=tracker[name]['avg_group'], op=torch.distributed.ReduceOp.AVG
             )
+            
+def reduce_aux_losses_tracker_across_ranks_hetero():
+    """Collect and reduce the auxiliary losses across ranks."""
+    tracker = parallel_state.get_moe_layer_wise_logging_tracker()
+    for name in tracker:
+        values = tracker[name]["values"]
+        # Reduce aux losses across ranks.
+        if tracker[name].get('reduce_group') is not None:
+            torch.distributed.all_reduce(values, group=tracker[name].get('reduce_group'))
+        if tracker[name].get('avg_group') is not None:
+            torch.distributed.all_reduce(
+                values, group=tracker[name]['avg_group'], op=torch.distributed.ReduceOp.AVG
+            )
+        pp_groups = parallel_state.get_pipeline_model_parallel_group()
+        assert isinstance(pp_groups, list), "pp_groups should be a list for hetero."
+        if len(pp_groups) > 1:
+            origin_values = values.clone().detach()
+            for pp_group in pp_groups:
+                values.copy_(origin_values)
+                torch.distributed.all_reduce(values, group=pp_group)
+        else:
+            torch.distributed.all_reduce(values, group=pp_groups[0])
 
 
 def track_moe_metrics(
-    loss_scale, iteration, writer, wandb_writer=None, total_loss_dict=None, per_layer_logging=False
+    loss_scale, iteration, writer, wandb_writer=None, total_loss_dict=None, per_layer_logging=False, enable_hetero=False
 ):
     """Track the MoE metrics for logging."""
     # Aux loss logging
-    reduce_aux_losses_tracker_across_ranks()
+    if not enable_hetero:
+        reduce_aux_losses_tracker_across_ranks()
+    else:
+        reduce_aux_losses_tracker_across_ranks_hetero()
+
     tracker = parallel_state.get_moe_layer_wise_logging_tracker()
     if writer is not None:
         aux_losses = {k: v['values'].float() * loss_scale for k, v in tracker.items()}

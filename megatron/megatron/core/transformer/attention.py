@@ -103,6 +103,10 @@ class Attention(MegatronModule, ABC):
         self.num_attention_heads_per_partition = divide(self.config.num_attention_heads, world_size)
         self.num_query_groups_per_partition = divide(self.config.num_query_groups, world_size)
 
+        # To support both CUDA Graphs and key value with different hidden size
+        self.key_hidden_size = self.hidden_size_per_attention_head
+        self.val_hidden_size = self.hidden_size_per_attention_head
+
         self.core_attention = build_module(
             submodules.core_attention,
             config=self.config,
@@ -169,14 +173,14 @@ class Attention(MegatronModule, ABC):
 
         return hidden_states
 
-    def _allocate_memory(self, inference_max_sequence_length, batch_size, dtype):
+    def _allocate_memory(self, inference_max_sequence_length, batch_size, dim, dtype):
         """Allocate memory to store kv cache during inference."""
 
         return torch.empty(
             inference_max_sequence_length,
             batch_size,
             self.num_query_groups_per_partition,
-            self.hidden_size_per_attention_head,
+            dim,
             dtype=dtype,
             device=torch.cuda.current_device(),
         )
@@ -211,10 +215,10 @@ class Attention(MegatronModule, ABC):
             inf_max_seq_length = inference_params.max_sequence_length
             inf_max_batch_size = inference_params.max_batch_size
             inference_key_memory = self._allocate_memory(
-                inf_max_seq_length, inf_max_batch_size, key.dtype
+                inf_max_seq_length, inf_max_batch_size, self.key_hidden_size, key.dtype
             )
             inference_value_memory = self._allocate_memory(
-                inf_max_seq_length, inf_max_batch_size, value.dtype
+                inf_max_seq_length, inf_max_batch_size, self.val_hidden_size, value.dtype
             )
             inference_params.key_value_memory_dict[self.layer_number] = (
                 inference_key_memory,
@@ -236,7 +240,10 @@ class Attention(MegatronModule, ABC):
         assert batch_end <= inference_key_memory.size(1)
         sequence_start = inference_params.sequence_len_offset
         sequence_end = sequence_start + key.size(0)
-        assert sequence_end <= inference_key_memory.size(0)
+        assert sequence_end <= inference_key_memory.size(0), (
+            "Current sequence length is longer than expected maximum sequence length! "
+            "Increase inference_max_seq_length."
+        )
 
         if self.config.flash_decode:
             assert (
@@ -306,7 +313,6 @@ class Attention(MegatronModule, ABC):
             "Flash Decoding requires the flash_attn_with_kvcache kernel, "
             "available in the flash-attn package."
         )
-        cache_seqlens = sequence_len_offset - 1
         q = query_layer.permute(1, 0, 2, 3)
         k = key_layer.permute(1, 0, 2, 3)
         v = value_layer.permute(1, 0, 2, 3)
@@ -326,7 +332,7 @@ class Attention(MegatronModule, ABC):
             v=v,
             rotary_cos=rotary_cos,
             rotary_sin=rotary_sin,
-            cache_seqlens=cache_seqlens,
+            cache_seqlens=sequence_len_offset,
             rotary_interleaved=False,
         )
         return out
@@ -349,7 +355,7 @@ class Attention(MegatronModule, ABC):
         """
 
         # hidden_states: [sq, b, h]
-        if self.config.flash_decode:
+        if self.config.flash_decode and not self.training:
             rotary_pos_emb = None
         else:
             assert rotary_pos_cos is None and rotary_pos_sin is None
@@ -375,6 +381,7 @@ class Attention(MegatronModule, ABC):
             self.config.flash_decode
             and inference_params is not None
             and inference_params.decode_mode
+            and not self.training
         ):
             assert self.layer_number in inference_params.key_value_memory_dict
             assert inference_params.sequence_len_offset is not None
