@@ -124,19 +124,13 @@ class FSTrainArguments:
         assert (
             self.args.standalone_embedding_stage == False
         ), "standalone not supported with process_meshes set!"
-        assert (
-            self.args.pipeline_model_parallel_split_rank == None
-        ), "pipeline_model_parallel_split_rank not supported with process_meshes set!"
         self.args.transformer_pipeline_model_parallel_size = self.args.pipeline_model_parallel_size
 
         # if untie_embeddings_and_output_weights is False, the first and last stage should have the same tp degree
-        if (
-            self.args.untie_embeddings_and_output_weights == False
-            or self.args.num_mtp_predictor > 0
-        ):
+        if self.args.untie_embeddings_and_output_weights == False or self.args.mtp_num_layers:
             assert (
                 hetero_process_meshes_tp[0] == hetero_process_meshes_tp[-1]
-            ), f"if untie_embeddings_and_output_weights is False or num_mtp_predictor is not 0, the first and last stage should have the same tp degree!"
+            ), f"if untie_embeddings_and_output_weights is False or mtp_num_layers is not 0, the first and last stage should have the same tp degree!"
 
             if (
                 hetero_process_meshes_dp[0] != hetero_process_meshes_dp[-1]

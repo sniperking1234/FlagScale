@@ -10,15 +10,20 @@ def get_hf_attn_ckpt(message, model, layer_id, args):
     nh = args.num_attention_heads
     ng = args.num_query_groups if args.group_query_attention else args.num_attention_heads
     dim = args.hidden_size
+    head_dim = (
+        args.hidden_size // args.num_attention_heads
+        if args.kv_channels is None
+        else args.kv_channels
+    )
     assert nh % ng == 0
 
     tf_layer = model.model.layers[layer_id]
     message["qkv weight"] = (
         torch.cat(
             [
-                tf_layer.self_attn.q_proj.weight.reshape((ng, dim // ng, -1)),
-                tf_layer.self_attn.k_proj.weight.reshape((ng, dim // nh, -1)),
-                tf_layer.self_attn.v_proj.weight.reshape((ng, dim // nh, -1)),
+                tf_layer.self_attn.q_proj.weight.reshape((ng, -1, head_dim, dim)),
+                tf_layer.self_attn.k_proj.weight.reshape((ng, -1, head_dim, dim)),
+                tf_layer.self_attn.v_proj.weight.reshape((ng, -1, head_dim, dim)),
             ],
             dim=1,
         )
@@ -48,6 +53,9 @@ def get_hf_attn_ckpt(message, model, layer_id, args):
         )
     if args.add_bias_linear:
         message["proj bias"] = tf_layer.self_attn.o_proj.bias.data
+    if args.qk_layernorm:
+        message["q norm weight"] = tf_layer.self_attn.q_norm.weight.data
+        message["k norm weight"] = tf_layer.self_attn.k_norm.weight.data
 
 
 def get_hf_mlp_ckpt(message, model, layer_id, args):
@@ -68,6 +76,15 @@ def get_hf_mlp_ckpt(message, model, layer_id, args):
             message[f"expert{id} l1 bias"] = expert.w2.bias.data
 
 
+def set_hf_embedding_ckpt(message, model, md, args):
+    print(
+        f"Warning: set_hf_embedding will change embedding shape-0 to true_vocab_size[{md.true_vocab_size}] ."
+    )
+    orig_word_embed = message.pop("word embeddings")
+    full_word_embed = padding_vocab_size(orig_word_embed, md, args)[: md.true_vocab_size, :]
+    model.model.embed_tokens.weight.data.copy_(full_word_embed)
+
+
 def set_hf_attn_ckpt(message, model, layer_id, md, args):
     qkv_weight = message.pop("qkv weight")
     proj_weight = message.pop("proj weight")
@@ -81,16 +98,24 @@ def set_hf_attn_ckpt(message, model, layer_id, md, args):
         qkv_bias = message.pop("qkv bias")
     if md.add_bias_linear:
         proj_bias = message.pop("proj bias")
+    if md.qk_layernorm:
+        q_norm_weight = message.pop("q norm weight")
+        k_norm_weight = message.pop("k norm weight")
 
     nh = args.num_attention_heads
     ng = args.num_query_groups if args.group_query_attention else args.num_attention_heads
     dim = args.hidden_size
+    head_dim = (
+        args.hidden_size // args.num_attention_heads
+        if args.kv_channels is None
+        else args.kv_channels
+    )
     assert nh % ng == 0
 
     tf_layer = model.model.layers[layer_id]
     # weight
-    qkv_weight = qkv_weight.view(ng, -1, dim)
-    qkv_weight = torch.split(qkv_weight, [dim // ng, dim // nh, dim // nh], dim=1)
+    qkv_weight = qkv_weight.view(ng, -1, head_dim, dim)
+    qkv_weight = torch.split(qkv_weight, split_size_or_sections=[nh // ng, 1, 1], dim=1)
     tf_layer.self_attn.q_proj.weight.data.copy_(qkv_weight[0].reshape(-1, dim))
     tf_layer.self_attn.k_proj.weight.data.copy_(qkv_weight[1].reshape(-1, dim))
     tf_layer.self_attn.v_proj.weight.data.copy_(qkv_weight[2].reshape(-1, dim))
@@ -109,6 +134,9 @@ def set_hf_attn_ckpt(message, model, layer_id, md, args):
         tf_layer.self_attn.v_proj.bias.data.copy_(qkv_bias[2].reshape(-1))
     if md.add_bias_linear:
         tf_layer.self_attn.o_proj.bias.data.copy_(proj_bias)
+    if md.qk_layernorm:
+        tf_layer.self_attn.q_norm.weight.data.copy_(q_norm_weight)
+        tf_layer.self_attn.k_norm.weight.data.copy_(k_norm_weight)
 
 
 def set_hf_mlp_ckpt(message, model, layer_id, md, args):
@@ -149,6 +177,23 @@ def set_hf_mlp_ckpt(message, model, layer_id, md, args):
                 expert.w1.bias.data.copy_(mlp_l0_bias_W)
                 expert.w3.bias.data.copy_(mlp_l0_bia_V)
                 expert.w2.bias.data.copy_(mlp_l1_bias)
+
+
+def set_hf_final_norm_ckpt(message, model, md, args):
+    model.model.norm.weight.data.copy_(message.pop("weight"))
+    if md.norm_has_bias:
+        model.model.norm.bias.data.copy_(message.pop("bias"))
+
+
+def set_hf_output_layer_ckpt(message, model, md, args):
+    print(
+        f"Warning: set_hf_output_layer will change output_layer shape-0 to true_vocab_size[{md.true_vocab_size}] ."
+    )
+    orig_output_layer_weight = message.pop("weight")
+    full_output_layer_weight = padding_vocab_size(orig_output_layer_weight, md, args)[
+        : md.true_vocab_size, :
+    ]
+    model.lm_head.weight.data.copy_(full_output_layer_weight)
 
 
 def _get_parallel_size(args):
@@ -227,6 +272,9 @@ def get_attn_ckpt(message, models, layer_id, args):
         message["qkv bias"] = torch.cat(qkv_bias, dim=0)
     if args.add_bias_linear:
         message["proj bias"] = proj_bias
+    if args.qk_layernorm:
+        message["q norm weight"] = tf_layer.self_attention.q_layernorm.weight.data
+        message["k norm weight"] = tf_layer.self_attention.k_layernorm.weight.data
 
 
 def get_mlp_ckpt(message, models, layer_id, args):
@@ -343,6 +391,9 @@ def set_attn_ckpt(message, models, layer_id, md, args):
         qkv_bias = torch.chunk(message.pop("qkv bias"), tp_size, dim=0)
     if md.add_bias_linear:
         proj_bias = message.pop("proj bias")
+    if md.qk_layernorm:
+        q_norm_weight = message.pop("q norm weight")
+        k_norm_weight = message.pop("k norm weight")
 
     # set data to transformer layer's self-attention
     for tp_ep_rank, model in enumerate(models):
@@ -359,6 +410,9 @@ def set_attn_ckpt(message, models, layer_id, md, args):
             tf_layer.self_attention.linear_qkv.bias.data.copy_(qkv_bias[tp_rank])
         if md.add_bias_linear:
             tf_layer.self_attention.linear_proj.bias.data.copy_(proj_bias)
+        if md.qk_layernorm:
+            tf_layer.self_attention.q_layernorm.weight.data.copy_(q_norm_weight)
+            tf_layer.self_attention.k_layernorm.weight.data.copy_(k_norm_weight)
 
 
 def set_mlp_ckpt(message, models, layer_id, md, args):

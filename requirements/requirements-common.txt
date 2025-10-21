@@ -1,20 +1,18 @@
-# torch
-torch==2.5.1
-torchvision
-torchaudio
---extra-index-url https://download.pytorch.org/whl/cu124
-
 # base
 accelerate
 cryptography
-deepspeed
 hydra-core
 matplotlib
 PyYAML
 pybind11==2.13.6
+scikit-build
+scikit-build-core
 sentencepiece
 tensorboard
 transformers
+ray
+pybase64
+orjson
 
 # test
 coverage
